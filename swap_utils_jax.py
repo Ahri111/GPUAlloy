@@ -31,6 +31,56 @@ class BeamResult(NamedTuple):
     log_probs: jnp.ndarray    # [batch, beam]
 
 
+# Atom type mapping for ABO3 perovskite
+ATOM_TYPES = {"Sr": 0, "Ti": 1, "Fe": 2, "O": 3, "VO": 4}
+
+
+# =============================================================================
+# Structure Generator
+# =============================================================================
+
+@partial(jax.jit, static_argnums=(1, 2, 3, 4, 5, 6))
+def generate_structures(
+    key: random.PRNGKey,
+    batch_size: int,
+    n_Sr: int, n_Ti: int, n_Fe: int, n_O: int, n_VO: int,
+) -> jnp.ndarray:
+    """
+    Generate random perovskite structures.
+
+    Args:
+        key: JAX random key
+        batch_size: Number of structures to generate
+        n_Sr, n_Ti, n_Fe, n_O, n_VO: Number of each atom type
+
+    Returns:
+        atom_types: [batch_size, N] where N = sum of all atoms
+    """
+    n_B = n_Ti + n_Fe
+    n_Osite = n_O + n_VO
+
+    key_b, key_o = random.split(key)
+
+    b_template = jnp.concatenate([
+        jnp.ones(n_Ti, dtype=jnp.int32) * ATOM_TYPES["Ti"],
+        jnp.ones(n_Fe, dtype=jnp.int32) * ATOM_TYPES["Fe"],
+    ])
+    o_template = jnp.concatenate([
+        jnp.ones(n_O, dtype=jnp.int32) * ATOM_TYPES["O"],
+        jnp.ones(n_VO, dtype=jnp.int32) * ATOM_TYPES["VO"],
+    ])
+
+    # Random permutation via argsort
+    noise_b = random.uniform(key_b, (batch_size, n_B))
+    noise_o = random.uniform(key_o, (batch_size, n_Osite))
+    b_configs = b_template[jnp.argsort(noise_b, axis=-1)]
+    o_configs = o_template[jnp.argsort(noise_o, axis=-1)]
+
+    a_configs = jnp.ones((batch_size, n_Sr), dtype=jnp.int32) * ATOM_TYPES["Sr"]
+
+    return jnp.concatenate([a_configs, b_configs, o_configs], axis=-1)
+
+
 # =============================================================================
 # Basic Swap Operations
 # =============================================================================
@@ -338,6 +388,63 @@ def apply_n_swaps(
 
     final, all_indices = lax.scan(scan_fn, atom_types, keys)
 
+    return final, all_indices
+
+
+@partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8, 9))
+def apply_n_swaps_both(
+    key: random.PRNGKey,
+    atom_types: jnp.ndarray,
+    scores: Optional[jnp.ndarray],
+    b_site_indices: Tuple[int, ...],
+    o_site_indices: Tuple[int, ...],
+    type_ti: int,
+    type_fe: int,
+    type_o: int,
+    type_vo: int,
+    n_swaps: int,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Apply n swap steps with random B/O site selection (like PyTorch 'both' mode).
+
+    Args:
+        key: random key
+        atom_types: [batch, N]
+        scores: [batch, N] or None
+        b_site_indices: B-site tuple
+        o_site_indices: O-site tuple
+        type_ti, type_fe: B-site types
+        type_o, type_vo: O-site types
+        n_swaps: number of steps
+
+    Returns:
+        final: [batch, N]
+        all_indices: [n_swaps, batch, 2]
+    """
+    keys = random.split(key, n_swaps * 2).reshape(n_swaps, 2, 2)
+
+    def scan_fn(carry, keys_i):
+        x = carry
+        key_choice, key_swap = keys_i[0], keys_i[1]
+
+        # Random choice: B-site or O-site (50/50)
+        do_b = random.uniform(key_choice) < 0.5
+
+        # Compute both swaps
+        result_b = sample_sublattice_swap(
+            key_swap, x, b_site_indices, type_ti, type_fe, scores
+        )
+        result_o = sample_sublattice_swap(
+            key_swap, x, o_site_indices, type_o, type_vo, scores
+        )
+
+        # Select based on random choice
+        swapped = jnp.where(do_b, result_b.swapped, result_o.swapped)
+        indices = jnp.where(do_b, result_b.indices, result_o.indices)
+
+        return swapped, indices
+
+    final, all_indices = lax.scan(scan_fn, atom_types, keys)
     return final, all_indices
 
 
