@@ -251,12 +251,14 @@ def train(args):
     )
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-    # Normalizer (collect train targets)
+    # Normalizer - compute directly from dataset (faster than iterating loader)
     print("Computing normalizer...")
+    train_size = int(0.7 * len(dataset))
     train_targets = []
-    for batch in train_loader:
-        train_targets.append(batch['target'])
-    train_targets = jnp.concatenate(train_targets, axis=0)
+    for i in range(train_size):
+        data = dataset[i]
+        train_targets.append(float(data.target[0]))
+    train_targets = jnp.array(train_targets)
     normalizer = Normalizer(train_targets)
     print(f"Target mean: {normalizer.mean:.4f}, std: {normalizer.std:.4f}")
 
