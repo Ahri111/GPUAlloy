@@ -1,43 +1,41 @@
 """
 CGFormer Training with JAX/Flax
 
+JAX 모델 저장 형식: pickle (.pkl)
+
 Usage:
     # Energy prediction training
-    python train_jax.py --mode energy --data_dir ./STFO_data --epochs 100
+    python train_jax.py --mode train --data_dir ./STFO_data --epochs 100
+
+    # Inference (예측)
+    python train_jax.py --mode predict --ckpt ./checkpoints_jax/best.pkl --data_dir ./STFO_data
 
     # Swap benchmark
     python train_jax.py --mode swap_benchmark
-
-    # Inference only
-    python train_jax.py --mode inference --ckpt ./checkpoints/params.pkl
 """
 
 import argparse
 import os
 import pickle
 import time
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from functools import partial
 
 import numpy as np
 
 import jax
 import jax.numpy as jnp
-from jax import random, lax
+from jax import random
 import flax.linen as nn
 from flax.training import train_state
 import optax
 
-from CGFormer_jax import CrystalGraphConvNet, CGFormerEncoder
+from CGFormer_jax import CrystalGraphConvNet
+from data_jax import CIFDataJAX, get_train_val_test_loader_jax
 from swap_utils_jax import (
-    ATOM_TYPES,
-    generate_structures,
-    sample_sublattice_swap,
-    sample_sublattice_swap_beam,
-    apply_n_swaps,
-    apply_n_swaps_both,
-    log_prob_sublattice_swap,
-    SwapResult, BeamResult,
+    ATOM_TYPES, generate_structures,
+    sample_sublattice_swap, sample_sublattice_swap_beam,
+    apply_n_swaps, apply_n_swaps_both,
 )
 
 print("="*60)
@@ -47,23 +45,59 @@ print("="*60)
 
 
 # =============================================================================
+# Normalizer
+# =============================================================================
+
+class Normalizer:
+    """Normalize targets to zero mean and unit variance."""
+
+    def __init__(self, data=None):
+        if data is not None:
+            self.mean = float(jnp.mean(data))
+            self.std = float(jnp.std(data))
+        else:
+            self.mean = 0.0
+            self.std = 1.0
+
+    def norm(self, x):
+        return (x - self.mean) / self.std
+
+    def denorm(self, x):
+        return x * self.std + self.mean
+
+    def state_dict(self):
+        return {'mean': self.mean, 'std': self.std}
+
+    def load_state_dict(self, d):
+        self.mean = d['mean']
+        self.std = d['std']
+
+
+# =============================================================================
 # Training State
 # =============================================================================
 
 class TrainState(train_state.TrainState):
-    """Extended TrainState with batch stats for BatchNorm."""
-    batch_stats: Optional[Dict[str, Any]] = None
+    """Extended TrainState with batch stats."""
+    batch_stats: Optional[Dict] = None
 
 
 def create_train_state(
     model: nn.Module,
     rng: random.PRNGKey,
-    dummy_inputs: Dict[str, jnp.ndarray],
+    dummy_batch: Dict,
     learning_rate: float = 1e-3,
     weight_decay: float = 1e-4,
 ) -> TrainState:
     """Create initial training state."""
-    variables = model.init(rng, **dummy_inputs, train=False)
+    variables = model.init(
+        rng,
+        dummy_batch['atom_fea'],
+        dummy_batch['nbr_fea'],
+        dummy_batch['nbr_fea_idx'],
+        dummy_batch['crystal_atom_idx'],
+        train=False
+    )
 
     params = variables['params']
     batch_stats = variables.get('batch_stats', None)
@@ -79,142 +113,308 @@ def create_train_state(
 
 
 # =============================================================================
-# Loss Functions
+# Training / Eval Steps
 # =============================================================================
 
-def mse_loss(predictions: jnp.ndarray, targets: jnp.ndarray) -> jnp.ndarray:
-    """Mean squared error loss."""
-    return jnp.mean((predictions - targets) ** 2)
-
-
-def mae_metric(predictions: jnp.ndarray, targets: jnp.ndarray) -> jnp.ndarray:
-    """Mean absolute error metric."""
-    return jnp.mean(jnp.abs(predictions - targets))
-
-
-# =============================================================================
-# Training Step
-# =============================================================================
-
-@partial(jax.jit, static_argnums=(0,))
-def train_step(
-    model: nn.Module,
-    state: TrainState,
-    batch: Tuple,
-    normalizer_mean: float,
-    normalizer_std: float,
-):
+def train_step(model, state, batch, normalizer):
     """Single training step."""
-    (atom_fea, nbr_fea, nbr_fea_idx, crystal_atom_idx), targets = batch
 
     def loss_fn(params):
         variables = {'params': params}
         if state.batch_stats is not None:
             variables['batch_stats'] = state.batch_stats
 
-        outputs, mutated_vars = model.apply(
-            variables,
-            atom_fea, nbr_fea, nbr_fea_idx, crystal_atom_idx,
-            train=True,
-            mutable=['batch_stats'] if state.batch_stats is not None else False,
-        )
+        if state.batch_stats is not None:
+            outputs, mutated = model.apply(
+                variables,
+                batch['atom_fea'],
+                batch['nbr_fea'],
+                batch['nbr_fea_idx'],
+                batch['crystal_atom_idx'],
+                train=True,
+                mutable=['batch_stats']
+            )
+            new_batch_stats = mutated['batch_stats']
+        else:
+            outputs = model.apply(
+                variables,
+                batch['atom_fea'],
+                batch['nbr_fea'],
+                batch['nbr_fea_idx'],
+                batch['crystal_atom_idx'],
+                train=True
+            )
+            new_batch_stats = None
 
-        # Normalize targets
-        targets_normed = (targets - normalizer_mean) / normalizer_std
-        loss = mse_loss(outputs, targets_normed)
+        targets = batch['target'].squeeze(-1)
+        targets_norm = normalizer.norm(targets)
+        loss = jnp.mean((outputs.squeeze(-1) - targets_norm) ** 2)
 
-        # Denormalize for MAE
-        outputs_denorm = outputs * normalizer_std + normalizer_mean
-        mae = mae_metric(outputs_denorm, targets)
-
-        new_batch_stats = mutated_vars.get('batch_stats', None) if isinstance(mutated_vars, dict) else None
-
-        return loss, (mae, new_batch_stats)
+        return loss, (outputs, new_batch_stats)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (mae, new_batch_stats)), grads = grad_fn(state.params)
+    (loss, (outputs, new_batch_stats)), grads = grad_fn(state.params)
 
     state = state.apply_gradients(grads=grads)
     if new_batch_stats is not None:
         state = state.replace(batch_stats=new_batch_stats)
 
+    # MAE
+    preds = normalizer.denorm(outputs.squeeze(-1))
+    targets = batch['target'].squeeze(-1)
+    mae = jnp.mean(jnp.abs(preds - targets))
+
     return state, loss, mae
 
 
-@partial(jax.jit, static_argnums=(0,))
-def eval_step(
-    model: nn.Module,
-    state: TrainState,
-    batch: Tuple,
-    normalizer_mean: float,
-    normalizer_std: float,
-):
+def eval_step(model, state, batch, normalizer):
     """Single evaluation step."""
-    (atom_fea, nbr_fea, nbr_fea_idx, crystal_atom_idx), targets = batch
-
     variables = {'params': state.params}
     if state.batch_stats is not None:
         variables['batch_stats'] = state.batch_stats
 
     outputs = model.apply(
         variables,
-        atom_fea, nbr_fea, nbr_fea_idx, crystal_atom_idx,
-        train=False,
+        batch['atom_fea'],
+        batch['nbr_fea'],
+        batch['nbr_fea_idx'],
+        batch['crystal_atom_idx'],
+        train=False
     )
 
-    targets_normed = (targets - normalizer_mean) / normalizer_std
-    loss = mse_loss(outputs, targets_normed)
+    targets = batch['target'].squeeze(-1)
+    targets_norm = normalizer.norm(targets)
+    loss = jnp.mean((outputs.squeeze(-1) - targets_norm) ** 2)
 
-    outputs_denorm = outputs * normalizer_std + normalizer_mean
-    mae = mae_metric(outputs_denorm, targets)
+    preds = normalizer.denorm(outputs.squeeze(-1))
+    mae = jnp.mean(jnp.abs(preds - targets))
 
-    return loss, mae
+    return loss, mae, preds
 
 
 # =============================================================================
-# Inference
+# Save / Load Checkpoint
 # =============================================================================
 
-@partial(jax.jit, static_argnums=(0,))
-def predict(
-    model: nn.Module,
-    params: Dict,
-    batch_stats: Optional[Dict],
-    atom_fea: jnp.ndarray,
-    nbr_fea: jnp.ndarray,
-    nbr_fea_idx: jnp.ndarray,
-    crystal_atom_idx,
-    normalizer_mean: float,
-    normalizer_std: float,
-):
-    """Run inference and denormalize outputs."""
-    variables = {'params': params}
-    if batch_stats is not None:
-        variables['batch_stats'] = batch_stats
+def save_checkpoint(path: str, state: TrainState, normalizer: Normalizer, epoch: int):
+    """Save checkpoint as pickle."""
+    checkpoint = {
+        'params': state.params,
+        'batch_stats': state.batch_stats,
+        'opt_state': state.opt_state,
+        'step': state.step,
+        'normalizer': normalizer.state_dict(),
+        'epoch': epoch,
+    }
+    with open(path, 'wb') as f:
+        pickle.dump(checkpoint, f)
+    print(f"Saved: {path}")
 
-    outputs = model.apply(
-        variables,
-        atom_fea, nbr_fea, nbr_fea_idx, crystal_atom_idx,
-        train=False,
+
+def load_checkpoint(path: str) -> Dict:
+    """Load checkpoint from pickle."""
+    with open(path, 'rb') as f:
+        checkpoint = pickle.load(f)
+    print(f"Loaded: {path}")
+    return checkpoint
+
+
+# =============================================================================
+# Training Loop
+# =============================================================================
+
+def train(args):
+    """Full training loop."""
+    print("\n" + "="*60)
+    print("JAX Training")
+    print("="*60)
+
+    # Dataset
+    print(f"\nLoading data from: {args.data_dir}")
+    dataset = CIFDataJAX(
+        root_dir=args.data_dir,
+        max_num_nbr=12,
+        radius=8.0,
+    )
+    print(f"Dataset size: {len(dataset)}")
+
+    # Data loaders
+    rng = random.PRNGKey(args.seed)
+    train_loader, val_loader, test_loader = get_train_val_test_loader_jax(
+        dataset,
+        batch_size=args.batch_size,
+        train_ratio=0.7,
+        val_ratio=0.15,
+        test_ratio=0.15,
+        return_test=True,
+        rng_key=rng,
+    )
+    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+
+    # Normalizer (collect train targets)
+    print("Computing normalizer...")
+    train_targets = []
+    for batch in train_loader:
+        train_targets.append(batch['target'])
+    train_targets = jnp.concatenate(train_targets, axis=0)
+    normalizer = Normalizer(train_targets)
+    print(f"Target mean: {normalizer.mean:.4f}, std: {normalizer.std:.4f}")
+
+    # Model
+    sample_batch = next(iter(train_loader))
+    model = CrystalGraphConvNet(
+        orig_atom_fea_len=sample_batch['atom_fea'].shape[-1],
+        nbr_fea_len=sample_batch['nbr_fea'].shape[-1],
+        atom_fea_len=args.atom_fea_len,
+        n_conv=args.n_conv,
+        h_fea_len=args.h_fea_len,
+        n_h=args.n_h,
+        graphormer_layers=args.graphormer_layers,
+        num_heads=args.num_heads,
     )
 
-    # Denormalize
-    return outputs * normalizer_std + normalizer_mean
+    # Initialize
+    rng, init_rng = random.split(rng)
+    state = create_train_state(
+        model, init_rng, sample_batch,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    n_params = sum(p.size for p in jax.tree_util.tree_leaves(state.params))
+    print(f"Model params: {n_params:,}")
+
+    # Training
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    best_val_mae = float('inf')
+    patience_counter = 0
+
+    for epoch in range(1, args.epochs + 1):
+        # Train
+        train_losses, train_maes = [], []
+        for batch in train_loader:
+            state, loss, mae = train_step(model, state, batch, normalizer)
+            train_losses.append(float(loss))
+            train_maes.append(float(mae))
+
+        train_loss = np.mean(train_losses)
+        train_mae = np.mean(train_maes)
+
+        # Validation
+        val_losses, val_maes = [], []
+        for batch in val_loader:
+            loss, mae, _ = eval_step(model, state, batch, normalizer)
+            val_losses.append(float(loss))
+            val_maes.append(float(mae))
+
+        val_loss = np.mean(val_losses)
+        val_mae = np.mean(val_maes)
+
+        print(f"Epoch {epoch:3d} | Train Loss: {train_loss:.4f} MAE: {train_mae:.4f} | "
+              f"Val Loss: {val_loss:.4f} MAE: {val_mae:.4f}")
+
+        # Checkpoint
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
+            patience_counter = 0
+            save_checkpoint(
+                os.path.join(args.ckpt_dir, 'best.pkl'),
+                state, normalizer, epoch
+            )
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
+    # Test
+    print("\n" + "="*60)
+    print("Testing")
+    print("="*60)
+
+    # Load best
+    ckpt = load_checkpoint(os.path.join(args.ckpt_dir, 'best.pkl'))
+    state = state.replace(params=ckpt['params'], batch_stats=ckpt.get('batch_stats'))
+    normalizer.load_state_dict(ckpt['normalizer'])
+
+    test_maes = []
+    for batch in test_loader:
+        loss, mae, _ = eval_step(model, state, batch, normalizer)
+        test_maes.append(float(mae))
+
+    test_mae = np.mean(test_maes)
+    print(f"Test MAE: {test_mae:.4f}")
+
+    return state, normalizer
+
+
+# =============================================================================
+# Prediction
+# =============================================================================
+
+def predict(args):
+    """Load model and run inference."""
+    print("\n" + "="*60)
+    print("JAX Prediction")
+    print("="*60)
+
+    # Load checkpoint
+    ckpt = load_checkpoint(args.ckpt)
+    normalizer = Normalizer()
+    normalizer.load_state_dict(ckpt['normalizer'])
+
+    # Dataset
+    dataset = CIFDataJAX(root_dir=args.data_dir)
+    loader, _, _ = get_train_val_test_loader_jax(
+        dataset, batch_size=args.batch_size,
+        train_ratio=0.0, val_ratio=0.0, test_ratio=1.0,
+        return_test=True
+    )
+
+    # Model
+    sample_batch = next(iter(loader))
+    model = CrystalGraphConvNet(
+        orig_atom_fea_len=sample_batch['atom_fea'].shape[-1],
+        nbr_fea_len=sample_batch['nbr_fea'].shape[-1],
+        atom_fea_len=args.atom_fea_len,
+        n_conv=args.n_conv,
+        h_fea_len=args.h_fea_len,
+        n_h=args.n_h,
+        graphormer_layers=args.graphormer_layers,
+        num_heads=args.num_heads,
+    )
+
+    # Create state with loaded params
+    rng = random.PRNGKey(0)
+    state = create_train_state(model, rng, sample_batch, learning_rate=1e-3)
+    state = state.replace(params=ckpt['params'], batch_stats=ckpt.get('batch_stats'))
+
+    # Predict
+    all_preds, all_targets, all_ids = [], [], []
+    for batch in loader:
+        _, _, preds = eval_step(model, state, batch, normalizer)
+        all_preds.extend(np.array(preds).tolist())
+        all_targets.extend(np.array(batch['target'].squeeze(-1)).tolist())
+        all_ids.extend(batch['cif_ids'])
+
+    # Results
+    print(f"\nPredictions: {len(all_preds)}")
+    print(f"{'ID':20s} {'Target':>10s} {'Pred':>10s} {'Error':>10s}")
+    print("-"*52)
+    for i in range(min(10, len(all_preds))):
+        err = abs(all_targets[i] - all_preds[i])
+        print(f"{all_ids[i]:20s} {all_targets[i]:10.4f} {all_preds[i]:10.4f} {err:10.4f}")
+
+    mae = np.mean(np.abs(np.array(all_targets) - np.array(all_preds)))
+    print(f"\nOverall MAE: {mae:.4f}")
 
 
 # =============================================================================
 # Swap Benchmark
 # =============================================================================
 
-def run_swap_benchmark(
-    batch_size: int = 10000,
-    n_swaps: int = 10000,
-    composition: Dict[str, int] = None,
-):
+def swap_benchmark(args):
     """Benchmark swap operations."""
-    if composition is None:
-        composition = {"Sr": 32, "Ti": 8, "Fe": 24, "O": 84, "VO": 12}
-
+    composition = {"Sr": 32, "Ti": 8, "Fe": 24, "O": 84, "VO": 12}
     N = sum(composition.values())
     n_B = composition["Ti"] + composition["Fe"]
 
@@ -226,30 +426,23 @@ def run_swap_benchmark(
     print(f"\n{'='*60}")
     print("SWAP BENCHMARK")
     print(f"{'='*60}")
-    print(f"Batch size: {batch_size}")
-    print(f"N swaps: {n_swaps}")
-    print(f"Atoms per structure: {N}")
-    print(f"B-site (Ti↔Fe): {len(b_site_idx)} positions")
-    print(f"O-site (O↔VO): {len(o_site_idx)} positions")
+    print(f"Batch: {args.swap_batch}, N_swaps: {args.n_swaps}, Atoms: {N}")
 
-    # Generate structures
     key = random.PRNGKey(42)
     key, subkey = random.split(key)
 
     structures = generate_structures(
-        subkey, batch_size,
+        subkey, args.swap_batch,
         composition["Sr"], composition["Ti"], composition["Fe"],
         composition["O"], composition["VO"]
     )
     structures.block_until_ready()
-    print(f"\nGenerated {batch_size} structures: {structures.shape}")
 
-    # Scores
     key, subkey = random.split(key)
     scores = random.normal(subkey, structures.shape)
 
-    def benchmark(name, fn, n_warmup=3, n_trials=5):
-        for _ in range(n_warmup):
+    def bench(name, fn, warmup=3, trials=5):
+        for _ in range(warmup):
             out = fn()
             if hasattr(out, 'block_until_ready'):
                 out.block_until_ready()
@@ -257,7 +450,7 @@ def run_swap_benchmark(
                 out[0].block_until_ready()
 
         times = []
-        for _ in range(n_trials):
+        for _ in range(trials):
             start = time.perf_counter()
             out = fn()
             if hasattr(out, 'block_until_ready'):
@@ -266,147 +459,24 @@ def run_swap_benchmark(
                 out[0].block_until_ready()
             times.append(time.perf_counter() - start)
 
-        avg = sum(times) / len(times)
-        print(f"{name:40s}: {avg*1000:10.2f} ms")
-        return avg
+        print(f"{name:40s}: {np.mean(times)*1000:8.2f} ms")
 
-    # Single swap
-    print(f"\n[1] sample_sublattice_swap")
+    print()
     key, subkey = random.split(key)
-    benchmark(
-        "B-site swap",
-        lambda: sample_sublattice_swap(subkey, structures, b_site_idx, 1, 2, scores)
-    )
+    bench("apply_n_swaps (B-site)",
+          lambda: apply_n_swaps(subkey, structures, scores, b_site_idx, 1, 2, args.n_swaps))
 
-    # N swaps - B-site only
-    print(f"\n[2] apply_n_swaps B-site only ({n_swaps}x)")
     key, subkey = random.split(key)
-    benchmark(
-        "B-site only",
-        lambda: apply_n_swaps(subkey, structures, scores, b_site_idx, 1, 2, n_swaps),
-        n_warmup=2, n_trials=3
-    )
+    bench("apply_n_swaps_both",
+          lambda: apply_n_swaps_both(
+              subkey, structures, scores,
+              b_site_idx, o_site_idx,
+              ATOM_TYPES["Ti"], ATOM_TYPES["Fe"],
+              ATOM_TYPES["O"], ATOM_TYPES["VO"],
+              args.n_swaps))
 
-    # N swaps - BOTH mode
-    print(f"\n[3] apply_n_swaps_both ({n_swaps}x)")
-    key, subkey = random.split(key)
-    benchmark(
-        "BOTH (B+O random)",
-        lambda: apply_n_swaps_both(
-            subkey, structures, scores,
-            b_site_idx, o_site_idx,
-            ATOM_TYPES["Ti"], ATOM_TYPES["Fe"],
-            ATOM_TYPES["O"], ATOM_TYPES["VO"],
-            n_swaps
-        ),
-        n_warmup=2, n_trials=3
-    )
-
-    # Beam search
-    print(f"\n[4] beam_search (k=4)")
-    benchmark(
-        "B-site beam",
-        lambda: sample_sublattice_swap_beam(structures, b_site_idx, 1, 2, scores, 4)
-    )
-
-    print(f"\n{'='*60}")
-    print("Benchmark completed!")
-
-
-# =============================================================================
-# Save/Load
-# =============================================================================
-
-def save_checkpoint(path: str, state: TrainState, normalizer: Dict):
-    """Save checkpoint."""
-    checkpoint = {
-        'params': state.params,
-        'batch_stats': state.batch_stats,
-        'opt_state': state.opt_state,
-        'step': state.step,
-        'normalizer': normalizer,
-    }
-    with open(path, 'wb') as f:
-        pickle.dump(checkpoint, f)
-    print(f"Saved checkpoint to {path}")
-
-
-def load_checkpoint(path: str) -> Dict:
-    """Load checkpoint."""
-    with open(path, 'rb') as f:
-        checkpoint = pickle.load(f)
-    print(f"Loaded checkpoint from {path}")
-    return checkpoint
-
-
-# =============================================================================
-# Example Training Loop (without DataLoader)
-# =============================================================================
-
-def example_training_loop():
-    """Example showing JAX training loop structure."""
-    print("\n" + "="*60)
-    print("Example JAX Training Loop (Structure Only)")
-    print("="*60)
-
-    # Model
-    model = CrystalGraphConvNet(
-        orig_atom_fea_len=92,
-        nbr_fea_len=41,
-        atom_fea_len=64,
-        n_conv=3,
-        h_fea_len=128,
-        n_h=1,
-        graphormer_layers=1,
-        num_heads=4,
-    )
-
-    # Dummy inputs for initialization
-    rng = random.PRNGKey(0)
-    dummy_atom_fea = jnp.zeros((10, 92))
-    dummy_nbr_fea = jnp.zeros((10, 12, 41))
-    dummy_nbr_fea_idx = jnp.zeros((10, 12), dtype=jnp.int32)
-    dummy_crystal_atom_idx = [jnp.arange(10)]
-
-    # Initialize
-    state = create_train_state(
-        model, rng,
-        {
-            'atom_fea': dummy_atom_fea,
-            'nbr_fea': dummy_nbr_fea,
-            'nbr_fea_idx': dummy_nbr_fea_idx,
-            'crystal_atom_idx': dummy_crystal_atom_idx,
-        },
-        learning_rate=1e-3,
-    )
-
-    print(f"Model initialized!")
-    print(f"  Params: {sum(p.size for p in jax.tree_util.tree_leaves(state.params)):,}")
-
-    # Training loop structure
-    print("""
-Training loop structure:
-
-    for epoch in range(num_epochs):
-        # Training
-        for batch in train_data:
-            state, loss, mae = train_step(model, state, batch, mean, std)
-
-        # Validation
-        val_losses = []
-        for batch in val_data:
-            loss, mae = eval_step(model, state, batch, mean, std)
-            val_losses.append(mae)
-
-        val_mae = jnp.mean(jnp.array(val_losses))
-
-        # Checkpoint
-        if val_mae < best_mae:
-            save_checkpoint('best.pkl', state, normalizer)
-            best_mae = val_mae
-    """)
-
-    return state
+    bench("beam_search (k=4)",
+          lambda: sample_sublattice_swap_beam(structures, b_site_idx, 1, 2, scores, 4))
 
 
 # =============================================================================
@@ -414,17 +484,28 @@ Training loop structure:
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='CGFormer JAX Training')
-
-    parser.add_argument('--mode', type=str, default='swap_benchmark',
-                        choices=['energy', 'swap_benchmark', 'inference', 'example'],
-                        help='Mode')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', type=str, default='train',
+                        choices=['train', 'predict', 'swap_benchmark'])
     parser.add_argument('--data_dir', type=str, default='./STFO_data')
+    parser.add_argument('--ckpt_dir', type=str, default='./checkpoints_jax')
+    parser.add_argument('--ckpt', type=str, default=None)
+
+    # Training
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--ckpt', type=str, default=None)
-    parser.add_argument('--ckpt_dir', type=str, default='./checkpoints_jax')
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--patience', type=int, default=20)
+    parser.add_argument('--seed', type=int, default=42)
+
+    # Model
+    parser.add_argument('--atom_fea_len', type=int, default=64)
+    parser.add_argument('--n_conv', type=int, default=3)
+    parser.add_argument('--h_fea_len', type=int, default=128)
+    parser.add_argument('--n_h', type=int, default=1)
+    parser.add_argument('--graphormer_layers', type=int, default=1)
+    parser.add_argument('--num_heads', type=int, default=4)
 
     # Swap benchmark
     parser.add_argument('--swap_batch', type=int, default=10000)
@@ -432,24 +513,14 @@ def main():
 
     args = parser.parse_args()
 
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-
-    if args.mode == 'swap_benchmark':
-        run_swap_benchmark(
-            batch_size=args.swap_batch,
-            n_swaps=args.n_swaps,
-        )
-    elif args.mode == 'example':
-        example_training_loop()
-    elif args.mode == 'energy':
-        print("Full JAX energy training requires data loading integration.")
-        print("See example_training_loop() for structure.")
-        example_training_loop()
-    elif args.mode == 'inference':
+    if args.mode == 'train':
+        train(args)
+    elif args.mode == 'predict':
         if args.ckpt is None:
-            raise ValueError("--ckpt required for inference mode")
-        checkpoint = load_checkpoint(args.ckpt)
-        print(f"Loaded params with {len(checkpoint['params'])} modules")
+            raise ValueError("--ckpt required")
+        predict(args)
+    elif args.mode == 'swap_benchmark':
+        swap_benchmark(args)
 
 
 if __name__ == '__main__':
