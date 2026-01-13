@@ -3,11 +3,17 @@ CGFormer Training with JAX/Flax
 
 JAX 모델 저장 형식: pickle (.pkl)
 
-가장 많이 쓰는 방식: PyTorch DataLoader + JAX 변환
+Data Loading Options:
+    1. PyTorch DataLoader + JAX 변환 (기본, 가장 안정적)
+    2. Full Memory Load (작은 데이터셋, MCMC용)
+    3. tf.data (TensorFlow 데이터 파이프라인)
 
 Usage:
-    # Energy prediction training
+    # Energy prediction training (PyTorch DataLoader 사용)
     python train_jax.py --mode train --data_dir ./STFO_data --epochs 100
+
+    # Full memory training (MCMC용, DataLoader 없음)
+    python train_jax.py --mode train --data_loader memory --data_dir ./STFO_data
 
     # Inference (예측)
     python train_jax.py --mode predict --ckpt ./checkpoints_jax/best.pkl --data_dir ./STFO_data
@@ -38,6 +44,7 @@ from torch.utils.data import DataLoader
 
 from CGFormer_jax import CrystalGraphConvNet
 from data import CIFData, collate_pool, get_train_val_test_loader
+from data_loading_jax import FullMemoryDataset, load_all_data
 from swap_utils_jax import (
     ATOM_TYPES, generate_structures,
     sample_sublattice_swap, sample_sublattice_swap_beam,
@@ -394,6 +401,133 @@ def train(args):
 
 
 # =============================================================================
+# Training Loop - Full Memory (No DataLoader)
+# =============================================================================
+
+def train_memory(args):
+    """Full training loop using FullMemoryDataset (no DataLoader, for MCMC)."""
+    print("\n" + "="*60)
+    print("JAX Training (Full Memory Load - No DataLoader)")
+    print("="*60)
+
+    # Load entire dataset into memory
+    print(f"\nLoading data from: {args.data_dir}")
+    dataset = load_all_data(
+        data_dir=args.data_dir,
+        max_num_nbr=12,
+        radius=8.0,
+        seed=args.seed,
+    )
+    print(f"Dataset size: {len(dataset)}")
+
+    # Get split indices
+    train_idx, val_idx, test_idx = dataset.get_split_indices(
+        train_ratio=0.7,
+        val_ratio=0.15,
+    )
+    print(f"Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+
+    # Normalizer (from precomputed targets)
+    train_targets = dataset.all_targets[train_idx]
+    normalizer = Normalizer(train_targets)
+    print(f"Target mean: {normalizer.mean:.4f}, std: {normalizer.std:.4f}")
+
+    # Sample batch for model init
+    sample_batch = dataset.get_batch([0, 1, 2])
+
+    # Model
+    model = CrystalGraphConvNet(
+        orig_atom_fea_len=sample_batch['atom_fea'].shape[-1],
+        nbr_fea_len=sample_batch['nbr_fea'].shape[-1],
+        atom_fea_len=args.atom_fea_len,
+        n_conv=args.n_conv,
+        h_fea_len=args.h_fea_len,
+        n_h=args.n_h,
+        graphormer_layers=args.graphormer_layers,
+        num_heads=args.num_heads,
+    )
+
+    # Initialize
+    rng = random.PRNGKey(args.seed)
+    rng, init_rng = random.split(rng)
+    state = create_train_state(
+        model, init_rng, sample_batch,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    n_params = sum(p.size for p in jax.tree_util.tree_leaves(state.params))
+    print(f"Model params: {n_params:,}")
+
+    # Training
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    best_val_mae = float('inf')
+    patience_counter = 0
+
+    for epoch in range(1, args.epochs + 1):
+        epoch_start = time.time()
+        rng, epoch_rng = random.split(rng)
+
+        # Train
+        train_losses, train_maes = [], []
+        for batch in dataset.iterate_batches(train_idx, args.batch_size, shuffle=True, rng=epoch_rng):
+            state, loss, mae = train_step(model, state, batch, normalizer)
+            train_losses.append(float(loss))
+            train_maes.append(float(mae))
+
+        train_loss = np.mean(train_losses)
+        train_mae = np.mean(train_maes)
+
+        # Validation
+        val_losses, val_maes = [], []
+        for batch in dataset.iterate_batches(val_idx, args.batch_size, shuffle=False):
+            loss, mae, _ = eval_step(model, state, batch, normalizer)
+            val_losses.append(float(loss))
+            val_maes.append(float(mae))
+
+        val_loss = np.mean(val_losses)
+        val_mae = np.mean(val_maes)
+
+        epoch_time = time.time() - epoch_start
+        print(f"Epoch {epoch:3d} ({epoch_time:.1f}s) | "
+              f"Train Loss: {train_loss:.4f} MAE: {train_mae:.4f} | "
+              f"Val Loss: {val_loss:.4f} MAE: {val_mae:.4f}")
+
+        # Checkpoint
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
+            patience_counter = 0
+            save_checkpoint(
+                os.path.join(args.ckpt_dir, 'best.pkl'),
+                state, normalizer, epoch
+            )
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
+    # Test
+    print("\n" + "="*60)
+    print("Testing")
+    print("="*60)
+
+    # Load best
+    ckpt = load_checkpoint(os.path.join(args.ckpt_dir, 'best.pkl'))
+    state = state.replace(params=ckpt['params'], batch_stats=ckpt.get('batch_stats'))
+    normalizer.load_state_dict(ckpt['normalizer'])
+
+    test_maes = []
+    for batch in dataset.iterate_batches(test_idx, args.batch_size, shuffle=False):
+        loss, mae, _ = eval_step(model, state, batch, normalizer)
+        test_maes.append(float(mae))
+
+    test_mae = np.mean(test_maes)
+    print(f"Test MAE: {test_mae:.4f}")
+
+    return state, normalizer, dataset
+
+
+# =============================================================================
 # Prediction
 # =============================================================================
 
@@ -538,6 +672,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='train',
                         choices=['train', 'predict', 'swap_benchmark'])
+    parser.add_argument('--data_loader', type=str, default='pytorch',
+                        choices=['pytorch', 'memory'],
+                        help='Data loading method: pytorch (PyTorch DataLoader) or memory (full memory load)')
     parser.add_argument('--data_dir', type=str, default='./STFO_data')
     parser.add_argument('--ckpt_dir', type=str, default='./checkpoints_jax')
     parser.add_argument('--ckpt', type=str, default=None)
@@ -566,7 +703,10 @@ def main():
     args = parser.parse_args()
 
     if args.mode == 'train':
-        train(args)
+        if args.data_loader == 'pytorch':
+            train(args)
+        elif args.data_loader == 'memory':
+            train_memory(args)
     elif args.mode == 'predict':
         if args.ckpt is None:
             raise ValueError("--ckpt required")
