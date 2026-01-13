@@ -19,6 +19,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from pymatgen.core.structure import Structure
+from pymatgen.core import DummySpecies
 
 
 class GaussianDistance:
@@ -181,6 +182,7 @@ class CIFDataJAX:
 
         with open(id_prop_file) as f:
             reader = csv.reader(f)
+            next(reader)  # Skip header row (matching PyTorch version)
             self.id_prop_data = [row for row in reader]
 
         random.seed(random_seed)
@@ -198,6 +200,13 @@ class CIFDataJAX:
     def __len__(self) -> int:
         return len(self.id_prop_data)
 
+    @staticmethod
+    def get_specie_number(specie):
+        """Get atomic number, handling DummySpecies (e.g., vacancies)."""
+        if isinstance(specie, DummySpecies):
+            return 0  # Return 0 for dummy species like vacancies (VO)
+        return specie.number
+
     def __getitem__(self, idx: int) -> CrystalGraphData:
         if idx in self._cache:
             return self._cache[idx]
@@ -205,9 +214,9 @@ class CIFDataJAX:
         cif_id, target = self.id_prop_data[idx]
         crystal = Structure.from_file(os.path.join(self.root_dir, cif_id + '.cif'))
 
-        # Atom features
+        # Atom features (with DummySpecies handling)
         atom_fea = np.vstack([
-            self.ari.get_atom_fea(crystal[i].specie.number)
+            self.ari.get_atom_fea(self.get_specie_number(crystal[i].specie))
             for i in range(len(crystal))
         ]).astype(np.float32)
 
