@@ -461,7 +461,37 @@ class CrystalGraphConvNet(nn.Module):
         return out
 
     def _pooling(self, atom_fea: jnp.ndarray, crystal_atom_idx: List[jnp.ndarray]) -> jnp.ndarray:
-        """Pool atom features to crystal features using mean pooling."""
+        """Pool atom features to crystal features using mean pooling.
+
+        Uses jax.ops.segment_sum for efficient batched pooling.
+        """
+        # Build segment_ids: each atom gets the index of its crystal
+        num_crystals = len(crystal_atom_idx)
+        total_atoms = atom_fea.shape[0]
+
+        # Create segment_ids array
+        segment_ids = jnp.zeros(total_atoms, dtype=jnp.int32)
+        counts = jnp.zeros(num_crystals, dtype=jnp.float32)
+
+        offset = 0
+        for i, idx_map in enumerate(crystal_atom_idx):
+            n_atoms = len(idx_map)
+            segment_ids = segment_ids.at[offset:offset + n_atoms].set(i)
+            counts = counts.at[i].set(float(n_atoms))
+            offset += n_atoms
+
+        # segment_sum for sum pooling
+        crys_fea_sum = jax.ops.segment_sum(
+            atom_fea, segment_ids, num_segments=num_crystals
+        )
+
+        # Mean pooling: divide by counts
+        crys_fea = crys_fea_sum / counts[:, None]
+
+        return crys_fea
+
+    def _pooling_legacy(self, atom_fea: jnp.ndarray, crystal_atom_idx: List[jnp.ndarray]) -> jnp.ndarray:
+        """Legacy pooling with for loop (for reference/debugging)."""
         crys_fea = []
         for idx_map in crystal_atom_idx:
             crys_fea.append(jnp.mean(atom_fea[idx_map], axis=0))
