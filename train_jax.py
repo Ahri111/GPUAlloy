@@ -3,9 +3,17 @@ CGFormer Training with JAX/Flax
 
 JAX 모델 저장 형식: pickle (.pkl)
 
+Data Loading Options:
+    1. PyTorch DataLoader + JAX 변환 (기본, 가장 안정적)
+    2. Full Memory Load (작은 데이터셋, MCMC용)
+    3. tf.data (TensorFlow 데이터 파이프라인)
+
 Usage:
-    # Energy prediction training
+    # Energy prediction training (PyTorch DataLoader 사용)
     python train_jax.py --mode train --data_dir ./STFO_data --epochs 100
+
+    # Full memory training (MCMC용, DataLoader 없음)
+    python train_jax.py --mode train --data_loader memory --data_dir ./STFO_data
 
     # Inference (예측)
     python train_jax.py --mode predict --ckpt ./checkpoints_jax/best.pkl --data_dir ./STFO_data
@@ -18,7 +26,7 @@ import argparse
 import os
 import pickle
 import time
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Dict, Any, List
 from functools import partial
 
 import numpy as np
@@ -30,8 +38,13 @@ import flax.linen as nn
 from flax.training import train_state
 import optax
 
+# PyTorch for DataLoader (가장 많이 쓰는 방식)
+import torch
+from torch.utils.data import DataLoader
+
 from CGFormer_jax import CrystalGraphConvNet
-from data_jax import CIFDataJAX, get_train_val_test_loader_jax
+from data import CIFData, collate_pool, get_train_val_test_loader
+from data_loading_jax import FullMemoryDataset, load_all_data
 from swap_utils_jax import (
     ATOM_TYPES, generate_structures,
     sample_sublattice_swap, sample_sublattice_swap_beam,
@@ -45,6 +58,30 @@ print("="*60)
 
 
 # =============================================================================
+# PyTorch -> JAX 변환
+# =============================================================================
+
+def torch_to_jax(x):
+    """Convert PyTorch tensor to JAX array."""
+    if isinstance(x, torch.Tensor):
+        return jnp.array(x.detach().cpu().numpy())
+    return x
+
+
+def convert_batch(batch):
+    """Convert PyTorch batch to JAX format."""
+    (atom_fea, nbr_fea, nbr_fea_idx, crystal_atom_idx), target, cif_ids = batch
+    return {
+        'atom_fea': torch_to_jax(atom_fea),
+        'nbr_fea': torch_to_jax(nbr_fea),
+        'nbr_fea_idx': torch_to_jax(nbr_fea_idx),
+        'crystal_atom_idx': [torch_to_jax(idx) for idx in crystal_atom_idx],
+        'target': torch_to_jax(target),
+        'cif_ids': cif_ids,
+    }
+
+
+# =============================================================================
 # Normalizer
 # =============================================================================
 
@@ -53,8 +90,8 @@ class Normalizer:
 
     def __init__(self, data=None):
         if data is not None:
-            self.mean = float(jnp.mean(data))
-            self.std = float(jnp.std(data))
+            self.mean = float(np.mean(data))
+            self.std = float(np.std(data))
         else:
             self.mean = 0.0
             self.std = 1.0
@@ -199,10 +236,10 @@ def eval_step(model, state, batch, normalizer):
 def save_checkpoint(path: str, state: TrainState, normalizer: Normalizer, epoch: int):
     """Save checkpoint as pickle."""
     checkpoint = {
-        'params': state.params,
-        'batch_stats': state.batch_stats,
-        'opt_state': state.opt_state,
-        'step': state.step,
+        'params': jax.device_get(state.params),
+        'batch_stats': jax.device_get(state.batch_stats) if state.batch_stats else None,
+        'opt_state': jax.device_get(state.opt_state),
+        'step': int(state.step),
         'normalizer': normalizer.state_dict(),
         'epoch': epoch,
     }
@@ -224,44 +261,52 @@ def load_checkpoint(path: str) -> Dict:
 # =============================================================================
 
 def train(args):
-    """Full training loop."""
+    """Full training loop using PyTorch DataLoader + JAX."""
     print("\n" + "="*60)
-    print("JAX Training")
+    print("JAX Training (PyTorch DataLoader)")
     print("="*60)
 
-    # Dataset
+    # Dataset (PyTorch)
     print(f"\nLoading data from: {args.data_dir}")
-    dataset = CIFDataJAX(
+    dataset = CIFData(
         root_dir=args.data_dir,
         max_num_nbr=12,
         radius=8.0,
     )
     print(f"Dataset size: {len(dataset)}")
 
-    # Data loaders
-    rng = random.PRNGKey(args.seed)
-    train_loader, val_loader, test_loader = get_train_val_test_loader_jax(
-        dataset,
+    # DataLoaders (PyTorch - 멀티프로세스 지원)
+    train_loader, val_loader, test_loader = get_train_val_test_loader(
+        dataset=dataset,
+        collate_fn=collate_pool,
         batch_size=args.batch_size,
         train_ratio=0.7,
         val_ratio=0.15,
         test_ratio=0.15,
         return_test=True,
-        rng_key=rng,
+        num_workers=args.num_workers,
+        pin_memory=False,
+        train_size=None,
+        val_size=None,
+        test_size=None,
     )
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-    # Normalizer (collect train targets)
+    # Normalizer (PyTorch로 빠르게 계산)
     print("Computing normalizer...")
     train_targets = []
     for batch in train_loader:
-        train_targets.append(batch['target'])
-    train_targets = jnp.concatenate(train_targets, axis=0)
+        _, target, _ = batch
+        train_targets.append(target)
+    train_targets = torch.cat(train_targets, dim=0).numpy()
     normalizer = Normalizer(train_targets)
     print(f"Target mean: {normalizer.mean:.4f}, std: {normalizer.std:.4f}")
 
+    # Sample batch for model init
+    sample_pt_batch = next(iter(train_loader))
+    sample_batch = convert_batch(sample_pt_batch)
+
     # Model
-    sample_batch = next(iter(train_loader))
     model = CrystalGraphConvNet(
         orig_atom_fea_len=sample_batch['atom_fea'].shape[-1],
         nbr_fea_len=sample_batch['nbr_fea'].shape[-1],
@@ -274,6 +319,7 @@ def train(args):
     )
 
     # Initialize
+    rng = random.PRNGKey(args.seed)
     rng, init_rng = random.split(rng)
     state = create_train_state(
         model, init_rng, sample_batch,
@@ -289,9 +335,12 @@ def train(args):
     patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
+        epoch_start = time.time()
+
         # Train
         train_losses, train_maes = [], []
-        for batch in train_loader:
+        for pt_batch in train_loader:
+            batch = convert_batch(pt_batch)
             state, loss, mae = train_step(model, state, batch, normalizer)
             train_losses.append(float(loss))
             train_maes.append(float(mae))
@@ -301,7 +350,8 @@ def train(args):
 
         # Validation
         val_losses, val_maes = [], []
-        for batch in val_loader:
+        for pt_batch in val_loader:
+            batch = convert_batch(pt_batch)
             loss, mae, _ = eval_step(model, state, batch, normalizer)
             val_losses.append(float(loss))
             val_maes.append(float(mae))
@@ -309,7 +359,9 @@ def train(args):
         val_loss = np.mean(val_losses)
         val_mae = np.mean(val_maes)
 
-        print(f"Epoch {epoch:3d} | Train Loss: {train_loss:.4f} MAE: {train_mae:.4f} | "
+        epoch_time = time.time() - epoch_start
+        print(f"Epoch {epoch:3d} ({epoch_time:.1f}s) | "
+              f"Train Loss: {train_loss:.4f} MAE: {train_mae:.4f} | "
               f"Val Loss: {val_loss:.4f} MAE: {val_mae:.4f}")
 
         # Checkpoint
@@ -337,7 +389,8 @@ def train(args):
     normalizer.load_state_dict(ckpt['normalizer'])
 
     test_maes = []
-    for batch in test_loader:
+    for pt_batch in test_loader:
+        batch = convert_batch(pt_batch)
         loss, mae, _ = eval_step(model, state, batch, normalizer)
         test_maes.append(float(mae))
 
@@ -345,6 +398,133 @@ def train(args):
     print(f"Test MAE: {test_mae:.4f}")
 
     return state, normalizer
+
+
+# =============================================================================
+# Training Loop - Full Memory (No DataLoader)
+# =============================================================================
+
+def train_memory(args):
+    """Full training loop using FullMemoryDataset (no DataLoader, for MCMC)."""
+    print("\n" + "="*60)
+    print("JAX Training (Full Memory Load - No DataLoader)")
+    print("="*60)
+
+    # Load entire dataset into memory
+    print(f"\nLoading data from: {args.data_dir}")
+    dataset = load_all_data(
+        data_dir=args.data_dir,
+        max_num_nbr=12,
+        radius=8.0,
+        seed=args.seed,
+    )
+    print(f"Dataset size: {len(dataset)}")
+
+    # Get split indices
+    train_idx, val_idx, test_idx = dataset.get_split_indices(
+        train_ratio=0.7,
+        val_ratio=0.15,
+    )
+    print(f"Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+
+    # Normalizer (from precomputed targets)
+    train_targets = dataset.all_targets[train_idx]
+    normalizer = Normalizer(train_targets)
+    print(f"Target mean: {normalizer.mean:.4f}, std: {normalizer.std:.4f}")
+
+    # Sample batch for model init
+    sample_batch = dataset.get_batch([0, 1, 2])
+
+    # Model
+    model = CrystalGraphConvNet(
+        orig_atom_fea_len=sample_batch['atom_fea'].shape[-1],
+        nbr_fea_len=sample_batch['nbr_fea'].shape[-1],
+        atom_fea_len=args.atom_fea_len,
+        n_conv=args.n_conv,
+        h_fea_len=args.h_fea_len,
+        n_h=args.n_h,
+        graphormer_layers=args.graphormer_layers,
+        num_heads=args.num_heads,
+    )
+
+    # Initialize
+    rng = random.PRNGKey(args.seed)
+    rng, init_rng = random.split(rng)
+    state = create_train_state(
+        model, init_rng, sample_batch,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    n_params = sum(p.size for p in jax.tree_util.tree_leaves(state.params))
+    print(f"Model params: {n_params:,}")
+
+    # Training
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    best_val_mae = float('inf')
+    patience_counter = 0
+
+    for epoch in range(1, args.epochs + 1):
+        epoch_start = time.time()
+        rng, epoch_rng = random.split(rng)
+
+        # Train
+        train_losses, train_maes = [], []
+        for batch in dataset.iterate_batches(train_idx, args.batch_size, shuffle=True, rng=epoch_rng):
+            state, loss, mae = train_step(model, state, batch, normalizer)
+            train_losses.append(float(loss))
+            train_maes.append(float(mae))
+
+        train_loss = np.mean(train_losses)
+        train_mae = np.mean(train_maes)
+
+        # Validation
+        val_losses, val_maes = [], []
+        for batch in dataset.iterate_batches(val_idx, args.batch_size, shuffle=False):
+            loss, mae, _ = eval_step(model, state, batch, normalizer)
+            val_losses.append(float(loss))
+            val_maes.append(float(mae))
+
+        val_loss = np.mean(val_losses)
+        val_mae = np.mean(val_maes)
+
+        epoch_time = time.time() - epoch_start
+        print(f"Epoch {epoch:3d} ({epoch_time:.1f}s) | "
+              f"Train Loss: {train_loss:.4f} MAE: {train_mae:.4f} | "
+              f"Val Loss: {val_loss:.4f} MAE: {val_mae:.4f}")
+
+        # Checkpoint
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
+            patience_counter = 0
+            save_checkpoint(
+                os.path.join(args.ckpt_dir, 'best.pkl'),
+                state, normalizer, epoch
+            )
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
+    # Test
+    print("\n" + "="*60)
+    print("Testing")
+    print("="*60)
+
+    # Load best
+    ckpt = load_checkpoint(os.path.join(args.ckpt_dir, 'best.pkl'))
+    state = state.replace(params=ckpt['params'], batch_stats=ckpt.get('batch_stats'))
+    normalizer.load_state_dict(ckpt['normalizer'])
+
+    test_maes = []
+    for batch in dataset.iterate_batches(test_idx, args.batch_size, shuffle=False):
+        loss, mae, _ = eval_step(model, state, batch, normalizer)
+        test_maes.append(float(mae))
+
+    test_mae = np.mean(test_maes)
+    print(f"Test MAE: {test_mae:.4f}")
+
+    return state, normalizer, dataset
 
 
 # =============================================================================
@@ -362,16 +542,20 @@ def predict(args):
     normalizer = Normalizer()
     normalizer.load_state_dict(ckpt['normalizer'])
 
-    # Dataset
-    dataset = CIFDataJAX(root_dir=args.data_dir)
-    loader, _, _ = get_train_val_test_loader_jax(
-        dataset, batch_size=args.batch_size,
-        train_ratio=0.0, val_ratio=0.0, test_ratio=1.0,
-        return_test=True
+    # Dataset (PyTorch)
+    dataset = CIFData(root_dir=args.data_dir)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_pool,
     )
 
+    # Sample batch for model init
+    sample_pt_batch = next(iter(loader))
+    sample_batch = convert_batch(sample_pt_batch)
+
     # Model
-    sample_batch = next(iter(loader))
     model = CrystalGraphConvNet(
         orig_atom_fea_len=sample_batch['atom_fea'].shape[-1],
         nbr_fea_len=sample_batch['nbr_fea'].shape[-1],
@@ -390,7 +574,8 @@ def predict(args):
 
     # Predict
     all_preds, all_targets, all_ids = [], [], []
-    for batch in loader:
+    for pt_batch in loader:
+        batch = convert_batch(pt_batch)
         _, _, preds = eval_step(model, state, batch, normalizer)
         all_preds.extend(np.array(preds).tolist())
         all_targets.extend(np.array(batch['target'].squeeze(-1)).tolist())
@@ -487,6 +672,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='train',
                         choices=['train', 'predict', 'swap_benchmark'])
+    parser.add_argument('--data_loader', type=str, default='pytorch',
+                        choices=['pytorch', 'memory'],
+                        help='Data loading method: pytorch (PyTorch DataLoader) or memory (full memory load)')
     parser.add_argument('--data_dir', type=str, default='./STFO_data')
     parser.add_argument('--ckpt_dir', type=str, default='./checkpoints_jax')
     parser.add_argument('--ckpt', type=str, default=None)
@@ -498,6 +686,7 @@ def main():
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--patience', type=int, default=20)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--num_workers', type=int, default=0)
 
     # Model
     parser.add_argument('--atom_fea_len', type=int, default=64)
@@ -514,7 +703,10 @@ def main():
     args = parser.parse_args()
 
     if args.mode == 'train':
-        train(args)
+        if args.data_loader == 'pytorch':
+            train(args)
+        elif args.data_loader == 'memory':
+            train_memory(args)
     elif args.mode == 'predict':
         if args.ckpt is None:
             raise ValueError("--ckpt required")
